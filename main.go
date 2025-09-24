@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/alecthomas/kingpin/v2"
 	"github.com/domainr/whois"
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -19,7 +21,6 @@ import (
 	"github.com/prometheus/common/promlog"
 	"github.com/prometheus/common/promlog/flag"
 	"github.com/prometheus/common/version"
-	"github.com/alecthomas/kingpin/v2"
 	"gopkg.in/yaml.v2"
 )
 
@@ -29,6 +30,7 @@ var (
 
 	configFile = kingpin.Flag("config", "Domain exporter configuration file.").Default("domains.yml").Envar("CONFIG").String()
 	httpBind   = kingpin.Flag("bind", "The address to listen on for HTTP requests.").Default(":9203").String()
+	apiKey     = kingpin.Flag("api-key", "API key for the backup WHOIS API service.").Envar("API_KEY").String()
 
 	domainExpiration = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -72,6 +74,12 @@ type Config struct {
 	Domains []string `yaml:"domains"`
 }
 
+type APIResponse struct {
+	Result struct {
+		ExpirationDate string `json:"expiration_date"`
+	} `json:"result"`
+}
+
 func main() {
 	flag.AddFlags(kingpin.CommandLine, &config)
 	kingpin.Version(version.Print("domain_exporter"))
@@ -86,7 +94,7 @@ func main() {
 	prometheus.Register(domainExpiration)
 	prometheus.Register(parsedExpiration)
 
-	config := Config{}
+	appConfig := Config{}
 
 	filename, err := filepath.Abs(*configFile)
 	if err != nil {
@@ -98,14 +106,14 @@ func main() {
 		level.Warn(logger).Log("warn", err)
 		level.Warn(logger).Log("warn", "Configuration file not present, you'll have to /probe me for metrics.")
 	}
-	err = yaml.Unmarshal(yamlFile, &config)
+	err = yaml.Unmarshal(yamlFile, &appConfig)
 
 	if err != nil {
 		level.Warn(logger).Log("warn", err)
 	} else {
 		go func() {
 			for {
-				for _, query := range config.Domains {
+				for _, query := range appConfig.Domains {
 					_, err = lookup(query, domainExpiration, parsedExpiration)
 					if err != nil {
 						level.Warn(logger).Log("warn", err)
@@ -183,14 +191,17 @@ func parse(host string, res []byte) (float64, error) {
 }
 
 func lookup(domain string, handler *prometheus.GaugeVec, parsedExpiration *prometheus.GaugeVec) (float64, error) {
+	// Primary lookup using domainr/whois
 	req, err := whois.NewRequest(domain)
 	if err != nil {
-		return -1, err
+		level.Warn(logger).Log("warn", fmt.Sprintf("Primary lookup failed for %s: %v. Trying backup API...", domain, err))
+		return lookupViaAPI(domain, handler, parsedExpiration)
 	}
 
 	res, err := whois.DefaultClient.Fetch(req)
 	if err != nil {
-		return -1, err
+		level.Warn(logger).Log("warn", fmt.Sprintf("Primary lookup failed for %s: %v. Trying backup API...", domain, err))
+		return lookupViaAPI(domain, handler, parsedExpiration)
 	}
 
 	date, err := parse(domain, res.Body)
@@ -198,7 +209,8 @@ func lookup(domain string, handler *prometheus.GaugeVec, parsedExpiration *prome
 		if parsedExpiration != nil {
 			parsedExpiration.WithLabelValues(domain).Set(0)
 		}
-		return -1, err
+		level.Warn(logger).Log("warn", fmt.Sprintf("Failed to parse WHOIS from primary lookup for %s: %v. Trying backup API...", domain, err))
+		return lookupViaAPI(domain, handler, parsedExpiration)
 	}
 
 	if handler != nil {
@@ -207,6 +219,73 @@ func lookup(domain string, handler *prometheus.GaugeVec, parsedExpiration *prome
 	if parsedExpiration != nil {
 		parsedExpiration.WithLabelValues(domain).Set(1)
 	}
-
 	return date, nil
+}
+
+func lookupViaAPI(domain string, handler *prometheus.GaugeVec, parsedExpiration *prometheus.GaugeVec) (float64, error) {
+	if *apiKey == "" {
+		err := errors.New("API key not provided. Cannot use backup method.")
+		level.Error(logger).Log("msg", err.Error())
+		return -1, err
+	}
+
+	url := fmt.Sprintf("https://api.apilayer.com/whois/query?domain=%s", domain)
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return -1, err
+	}
+	req.Header.Set("apikey", *apiKey)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return -1, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		err := fmt.Errorf("API request failed with status code: %d", resp.StatusCode)
+		level.Error(logger).Log("msg", err.Error())
+		return -1, err
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return -1, err
+	}
+
+	var apiResponse APIResponse
+	err = json.Unmarshal(body, &apiResponse)
+	if err != nil {
+		return -1, fmt.Errorf("failed to unmarshal JSON from API response: %v", err)
+	}
+
+	if apiResponse.Result.ExpirationDate == "" {
+		err := errors.New("expiration date not found in API response")
+		level.Warn(logger).Log("warn", err.Error())
+		if parsedExpiration != nil {
+			parsedExpiration.WithLabelValues(domain).Set(0)
+		}
+		return -1, err
+	}
+
+	date, err := time.Parse("2006-01-02 15:04:05", apiResponse.Result.ExpirationDate)
+	if err != nil {
+		if parsedExpiration != nil {
+			parsedExpiration.WithLabelValues(domain).Set(0)
+		}
+		return -1, fmt.Errorf("failed to parse expiration date from API: %v", err)
+	}
+
+	level.Info(logger).Log("domain:", domain, "date (API):", date)
+	unixTimestamp := float64(date.Unix())
+	if handler != nil {
+		handler.WithLabelValues(domain).Set(unixTimestamp)
+	}
+	if parsedExpiration != nil {
+		parsedExpiration.WithLabelValues(domain).Set(1)
+	}
+
+	return unixTimestamp, nil
 }
